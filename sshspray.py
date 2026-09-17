@@ -1,4 +1,4 @@
-from paramiko import SSHClient, AutoAddPolicy, RSAKey, DSSKey, ECDSAKey, Ed25519Key
+from paramiko import SSHClient, AutoAddPolicy, RSAKey, ECDSAKey, Ed25519Key
 from paramiko.ssh_exception import SSHException, PasswordRequiredException
 from paramiko.hostkeys import HostKeys
 from paramiko.util import log_to_file
@@ -10,8 +10,9 @@ from queue import Queue
 from sys import exit
 from re import compile
 from os import devnull
-
 from os.path import isfile
+from time import sleep
+from random import uniform
 
 
 class Message:
@@ -42,7 +43,7 @@ class Message:
 
 
 class KeyChecks:
-    KEY_TYPES = [RSAKey, DSSKey, ECDSAKey, Ed25519Key]
+    KEY_TYPES = [RSAKey, ECDSAKey, Ed25519Key]
 
     def __init__(self, key_file, passphrase):
         self.key_file = key_file
@@ -105,7 +106,8 @@ class KeyChecks:
 
 class Sprayer:
     def __init__(self, queue, username, key_file, password, passphrase,
-                 host_key_file, port, timeout, target_list, verbosity):
+                 host_key_file, port, timeout, target_list, verbosity,
+                 threads, jitter_min, jitter_max):
         self.queue = queue
         self.username = username
         self.key_file = key_file
@@ -116,10 +118,15 @@ class Sprayer:
         self.timeout = timeout
         self.verbose = verbosity
         self.target_list = target_list
+        self.threads = threads
+        self.jitter_min = jitter_min
+        self.jitter_max = jitter_max
 
     def do_work(self):
         while True:
             ip = self.queue.get()
+            if self.jitter_max > 0:
+                sleep(uniform(self.jitter_min, self.jitter_max))
             self.try_auth(ip)
             self.queue.task_done()
 
@@ -151,8 +158,12 @@ class Sprayer:
                 print(*output[0:self.verbose+1])
 
     def run(self) -> None:
-        print(Message.info(), "Running against {hostcount} hosts...".format(hostcount=len(self.target_list)))
-        for i in range(self.queue.maxsize):
+        jitter_info = ""
+        if self.jitter_max > 0:
+            jitter_info = " | jitter: {min:.1f}-{max:.1f}s".format(min=self.jitter_min, max=self.jitter_max)
+        print(Message.info(), "Running against {hostcount} hosts with {threads} threads{jitter}...".format(
+            hostcount=len(self.target_list), threads=self.threads, jitter=jitter_info))
+        for i in range(self.threads):
             t = Thread(target=self.do_work)
             t.daemon = True
             t.start()
@@ -168,6 +179,17 @@ class Sprayer:
                 raise e
 
 
+def parse_jitter(value):
+    if '-' in value:
+        parts = value.split('-', 1)
+        jmin, jmax = float(parts[0]), float(parts[1])
+    else:
+        jmin, jmax = 0.0, float(value)
+    if jmin < 0 or jmax < 0 or jmin > jmax:
+        raise ValueError("Invalid jitter range: {v}".format(v=value))
+    return jmin, jmax
+
+
 def arg_parse():
     parser = ArgumentParser(description="Multithreaded, queued SSH key and/or password spraying tool by M. Cory Billington")
     parser.add_argument("-q", "--queue-size", nargs='?', default=200, type=int)
@@ -178,13 +200,15 @@ def arg_parse():
     parser.add_argument("-p", "--password", help="Password to test against targets")
     parser.add_argument("-P", "--port", default=22, help="Port to connect on")
     parser.add_argument("-v", "--verbose", action='count', default=0, help="Show failures. Use '-vv-' to show reasons for failure")
-    parser.add_argument("-t", "--target-list", required=True, help="List of hosts to test(hostname, ip, and/or CIDR)")
+    parser.add_argument("-T", "--target-list", required=True, help="List of hosts to test (hostname, ip, and/or CIDR)")
+    parser.add_argument("-t", "--threads", default=10, type=int, help="Number of concurrent threads (default: 10)")
+    parser.add_argument("-j", "--jitter", default=None, help="Delay between auth attempts per thread in seconds. Single value (e.g. 2) = 0-2s random. Range (e.g. 0.5-2.0) = min-max random")
     parser.add_argument("-w", "--wait", nargs='?', default=1, type=int, help="Timeout for each connection in seconds")
     return parser.parse_args()
 
 
 def get_host_list(file):
-    valid_cidr = compile('^(?:(?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}(?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\/([1-9]|1[0-9]|2[0-9]|3[0-2])$')
+    valid_cidr = compile(r'^(?:(?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}(?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\/([1-9]|1[0-9]|2[0-9]|3[0-2])$')
     try:
         with open(file, 'r') as f:
             rhosts = f.read().splitlines()
@@ -227,6 +251,14 @@ def main():
     if key_check.is_encrypted:
         passphrase = key_check.passphrase
 
+    jitter_min, jitter_max = 0.0, 0.0
+    if args.jitter:
+        try:
+            jitter_min, jitter_max = parse_jitter(args.jitter)
+        except ValueError as e:
+            print(Message.fail(), str(e))
+            exit(1)
+
     verbosity = 2 if args.verbose > 2 else args.verbose
     queue = Queue(args.queue_size)
     HostKeys(args.host_key_file)
@@ -241,7 +273,10 @@ def main():
                       passphrase=passphrase,
                       timeout=args.wait,
                       verbosity=verbosity,
-                      target_list=targets)
+                      target_list=targets,
+                      threads=args.threads,
+                      jitter_min=jitter_min,
+                      jitter_max=jitter_max)
     sprayer.run()
 
 
